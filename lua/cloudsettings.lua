@@ -854,7 +854,9 @@ function cloudsettings.cabinet_account(config_path, deps)
     return json.encode({ success = false, reason = "unreachable", server = server,
                          host = host, error = tostring(herr or "request failed") })
   end
-  if resp.status == 401 or resp.status == 403 then
+  -- Only 401 means revoked: Cabinet answers a bad token with 401, while a 403
+  -- is Cloudflare's own block page (e.g. 1010) and says nothing about the token.
+  if resp.status == 401 then
     return json.encode({ success = false, reason = "revoked", server = server, host = host })
   end
   local ok, body = pcall(json.decode, resp.body or "")

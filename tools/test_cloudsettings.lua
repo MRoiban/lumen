@@ -792,6 +792,9 @@ do
   local revoked = json.decode(cs.cabinet_account(cfgp,
     { http = fake_http(401, '{"error":"unauthorized"}') }))
   eq(revoked.reason, "revoked", "a 401 reads as a revoked device")
+  local blocked = json.decode(cs.cabinet_account(cfgp,
+    { http = fake_http(403, "<html>error code: 1010</html>") }))
+  eq(blocked.reason, "unreachable", "a Cloudflare 403 is not mistaken for a revoked token")
   local offline = json.decode(cs.cabinet_account(cfgp,
     { http = { get = function() return nil, "timeout" end } }))
   eq(offline.reason, "unreachable", "a transport failure reads as unreachable")
