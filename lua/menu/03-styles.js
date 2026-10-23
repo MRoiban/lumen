@@ -583,6 +583,12 @@
       ".lumen-cloud-btn.secondary:hover{background:rgba(255,255,255,.08);color:#fff;",
       "border-color:rgba(255,255,255,.3);}",
       ".lumen-cloud-btn.busy{opacity:.6;pointer-events:none;}",
+      // Cabinet pairing: code field + Connect side by side, Advanced disclosure.
+      ".lumen-cabinet-ctrl{gap:8px;}",
+      ".lumen-row input.lumen-cabinet-code{width:150px;font-family:monospace;letter-spacing:.06em;}",
+      ".lumen-cabinet-msg{margin:-4px 2px 6px;}",
+      ".lumen-cabinet-msg.err{color:#ec5c5c;}",
+      ".lumen-cabinet-adv{display:inline-block;margin:2px 0 4px;padding:2px 2px;font-size:12px;}",
       ".lumen-cloud-actions{position:sticky;bottom:0;z-index:4;display:flex;align-items:center;",
       "justify-content:space-between;gap:12px;margin:18px -8px 0;padding:12px;",
       "background:#23262d;border:1px solid rgba(255,255,255,.12);border-radius:5px;",

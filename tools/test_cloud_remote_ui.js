@@ -105,6 +105,13 @@ const pendingAuth = comparableDraft({
 });
 eq(pendingAuth.authenticated.gdrive, true,
   "a staged OAuth login remains part of the draft even after selecting another provider");
+const repaired = comparableDraft({
+  provider: "cabinet", sync_activity: false, sign_out_provider: null,
+  settings: { cabinet: {} }, authenticated: { cabinet: true },
+  cabinet_account: { host: "cabinet.mc2.onl", user: { name: "Mihai" } },
+});
+eq(repaired.cabinet_staged, true,
+  "re-pairing over a stored Cabinet token still marks the draft as changed");
 
 if (!cloud.includes("local_appids")) {
   console.error("FAIL: remote RPC payload does not include local_appids");

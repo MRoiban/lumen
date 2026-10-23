@@ -28,7 +28,8 @@ const okmsg = (m) => console.log("ok   " + m);
   if (!/function\s+renderCloud/.test(src)) fail("12-cloud-tab.js missing renderCloud()");
   for (const rpc of ["LumenCloudStatus", "LumenCloudApplyAndRestart",
                      "LumenCloudDiscardPending", "LumenCloudAuthorize",
-                     "LumenCloudAuthPoll", "LumenCloudApps", "LumenCloudRemoteApps"]) {
+                     "LumenCloudAuthPoll", "LumenCloudApps", "LumenCloudRemoteApps",
+                     "LumenCloudCabinetConnect", "LumenCloudCabinetAccount"]) {
     if (!src.includes(rpc)) fail("12-cloud-tab.js does not call " + rpc);
   }
   if (fails === 0) okmsg("12-cloud-tab.js defines renderCloud and calls all LumenCloud* RPCs");
@@ -36,7 +37,7 @@ const okmsg = (m) => console.log("ok   " + m);
   if (src.includes("LumenCloudSetProvider") || src.includes("LumenCloudSetToggle"))
     fail("Cloud draft still writes provider/toggles immediately");
   else okmsg("Cloud provider and activity edits stay in a draft until apply");
-  for (const provider of ["folder", "r2", "s3"]) {
+  for (const provider of ["cabinet", "folder", "r2", "s3"]) {
     if (!src.includes('"' + provider + '"')) fail("missing provider option: " + provider);
   }
   if (!src.includes("saveRestart") || !src.includes("cancelChanges"))
@@ -127,6 +128,30 @@ if (!ptCloud) {
                      "s3AllowInsecureTls", "s3CaCertPath"]) {
     if (!ptCloud[key]) fail("pt-BR cloud missing S3/R2 setting copy: " + key);
   }
+}
+
+// 3b) Cabinet pairing copy exists in both languages, is translated, and keeps
+//     the {host}/{name} placeholders the tab substitutes.
+{
+  const cabinetKeys = Object.keys(enCloud).filter((k) => k.startsWith("cabinet"));
+  if (cabinetKeys.length < 15) fail("en cloud is missing the Cabinet pairing copy");
+  if (!enCloud.providerCabinet) fail("en cloud has no providerCabinet label");
+  if (ptCloud) {
+    for (const k of cabinetKeys) {
+      if (!ptCloud[k]) { fail("pt-BR cloud missing Cabinet copy: " + k); continue; }
+      for (const ph of ["{host}", "{name}"]) {
+        if (enCloud[k].includes(ph) && !ptCloud[k].includes(ph))
+          fail(`pt-BR cloud.${k} drops the ${ph} placeholder`);
+      }
+    }
+    for (const k of ["cabinetCode", "cabinetConnect", "cabinetDisconnect", "cabinetRevoked",
+                     "cabinetCodeInvalid", "cabinetServerHint"]) {
+      if (ptCloud[k] === enCloud[k]) fail(`pt-BR cloud.${k} is still English`);
+    }
+  }
+  if (enCloud.cabinetConnectedAs !== "Connected to {host} as {name}")
+    fail("en connected-as copy is not the approved wording");
+  okmsg(`Cabinet pairing copy: ${cabinetKeys.length} keys in en and pt-BR`);
 }
 
 // 4) cloudStrings() follows the picked language, en fallback for unknown locales.

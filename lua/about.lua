@@ -24,9 +24,11 @@ local about = {}
 -- The three stack components, in display order. `key` matches the versions.json
 -- field the installer writes; `repo` is the GitHub owner/name for the API;
 -- `asset_pat` is a Lua pattern matching the release asset filename (so we can
--- read THAT asset's fingerprint, not just the tag).
+-- read THAT asset's fingerprint, not just the tag). slsteam-moon and Lumen are
+-- read from the MRoiban forks, whose releases are what this build installs; the
+-- LuaTools plugin is still published upstream.
 about.COMPONENTS = {
-  { key = "slsteam_moon", name = "slsteam-moon",    repo = "swwayps/slsteam-moon",
+  { key = "slsteam_moon", name = "slsteam-moon",    repo = "MRoiban/slsteam-moon",
     mirror_key = "slsteam-moon",
     asset_pat = "^slsteam%-moon%-linux%-.*%-lumen%.zip$",
     beta_path = "dist/slsteam-moon-linux.zip" },
@@ -34,7 +36,7 @@ about.COMPONENTS = {
     mirror_key = "plugin",
     asset_pat = "^luatools%-linux%.zip$",
     beta_path = "dist/luatools-linux.zip" },
-  { key = "lumen",        name = "Lumen",           repo = "swwayps/lumen",
+  { key = "lumen",        name = "Lumen",           repo = "MRoiban/lumen",
     mirror_key = "lumen",
     asset_pat = "^lumen%-linux%.zip$",
     beta_path = "dist/lumen-linux.zip" },

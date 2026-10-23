@@ -75,7 +75,7 @@ do
   check("script pipes to bash", s:find("| bash", 1, true) ~= nil)
   check("script pauses only on failure", s:find('status" %-ne 0') ~= nil)
   check("autofix url points at slsteam-moon raw branch",
-    slscheck.AUTOFIX_URL:find("swwayps/slsteam%-moon/slsteam%-moon/autofix%.sh") ~= nil)
+    slscheck.AUTOFIX_URL:find("MRoiban/slsteam%-moon/slsteam%-moon/autofix%.sh") ~= nil)
 end
 
 -- ── run_autofix orchestration (injected effects) ─────────────────────────────

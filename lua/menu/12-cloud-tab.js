@@ -11,6 +11,9 @@
   var _cloudAuthTimer = null;
   var _cloudApplied = null;
   var _cloudDraft = null;
+  // One GET /api/me per tab load: the tab re-renders on every draft edit, and
+  // the account line must not re-ask the server each time.
+  var _cloudCabinetLookup = null;
   function cloudStopAuthPoll() {
     if (_cloudAuthTimer) { clearTimeout(_cloudAuthTimer); _cloudAuthTimer = null; }
   }
@@ -54,7 +57,7 @@
     var providers = status.providers || {};
     var authenticated = {};
     var settings = {};
-    ["local", "folder", "gdrive", "onedrive", "r2", "s3"].forEach(function (name) {
+    ["local", "cabinet", "folder", "gdrive", "onedrive", "r2", "s3"].forEach(function (name) {
       authenticated[name] = !!(providers[name] && providers[name].authenticated);
       settings[name] = cloudClone(providers[name] && providers[name].settings || {});
     });
@@ -64,6 +67,11 @@
       authenticated: authenticated,
       settings: settings,
       sign_out_provider: null,
+      // A pairing redeemed in this draft: {server, host, user}. Staged
+      // backend-side until "Save and restart", like an OAuth login.
+      cabinet_account: null,
+      cabinet_server: "",
+      cabinet_advanced: false,
     };
   }
 
@@ -78,7 +86,11 @@
       authenticated: {
         gdrive: !!draft.authenticated.gdrive,
         onedrive: !!draft.authenticated.onedrive,
+        cabinet: !!draft.authenticated.cabinet,
       },
+      // A re-pairing over a stored (e.g. revoked) token leaves `authenticated`
+      // unchanged, so the staged pairing itself has to mark the draft dirty.
+      cabinet_staged: !!draft.cabinet_account,
     };
   }
 
@@ -161,7 +173,8 @@
 
   function cloudProviderLabel(S, provider) {
     return {
-      local: S.providerNone, folder: S.providerFolder, gdrive: S.providerGdrive,
+      local: S.providerNone, cabinet: S.providerCabinet, folder: S.providerFolder,
+      gdrive: S.providerGdrive,
       onedrive: S.providerOnedrive, r2: S.providerR2, s3: S.providerS3,
     }[provider] || provider;
   }
@@ -261,6 +274,200 @@
       "/path/to/ca.pem", false, function (value) { current.ca_cert_path = value; }));
   }
 
+  // ── Cabinet (self-hosted) pairing ──────────────────────────────────────
+  // Mirrors the backend's reading of a pairing code (Crockford base32: case-
+  // insensitive, spaces/dashes ignored, O->0, I/L->1) so a typo is caught
+  // before it spends one of the server's rate-limited attempts.
+  function cloudCabinetNormalizeCode(raw) {
+    var s = String(raw == null ? "" : raw).toUpperCase().replace(/[\s-]/g, "")
+      .replace(/O/g, "0").replace(/[IL]/g, "1");
+    if (!/^[0-9A-HJKMNP-TV-Z]{12}$/.test(s)) return null;
+    return s.slice(0, 4) + "-" + s.slice(4, 8) + "-" + s.slice(8);
+  }
+
+  // Live grouping while typing (XXXX-XXXX-XXXX). A pasted connect link is
+  // left untouched: it is accepted in the code field too.
+  function cloudCabinetFormatInput(raw) {
+    var value = String(raw == null ? "" : raw);
+    if (value.indexOf("://") !== -1) return value.trim();
+    var s = value.toUpperCase().replace(/[^0-9A-Z]/g, "").slice(0, 12);
+    return s.replace(/(.{4})(?=.)/g, "$1-");
+  }
+
+  function cloudCabinetConnectedText(S, account) {
+    var user = account && account.user || {};
+    return S.cabinetConnectedAs
+      .replace("{host}", account && account.host || "")
+      .replace("{name}", user.name || user.id || "?");
+  }
+
+  function cloudCabinetErrorText(S, result) {
+    var reason = result && result.reason;
+    if (reason === "invalid_code") return S.cabinetCodeInvalid;
+    if (reason === "code_rejected") return S.cabinetCodeRejected;
+    if (reason === "too_many_attempts") return S.cabinetTooMany;
+    if (reason === "invalid_server") return S.cabinetServerInvalid;
+    if (reason === "cli_missing") return S.cabinetCliMissing;
+    return S.cabinetConnectFail + (result && result.error || "?");
+  }
+
+  function cloudCabinetButton(text, secondary) {
+    var btn = document.createElement("div");
+    btn.className = secondary ? "lumen-cloud-btn secondary" : "lumen-cloud-btn";
+    // role=button puts it in the settings window's gamepad focus order.
+    btn.setAttribute("role", "button");
+    btn.textContent = text;
+    return btn;
+  }
+
+  function cloudRenderCabinet(body, S, status) {
+    var draft = _cloudDraft;
+    var staged = draft.cabinet_account;
+    var stored = !!draft.authenticated.cabinet && !staged;
+    var applied = (status.providers && status.providers.cabinet || {}).settings || {};
+
+    var srow = document.createElement("div"); srow.className = "lumen-row";
+    var swrap = document.createElement("div"); swrap.className = "lumen-lblwrap";
+    var stat = document.createElement("div"); stat.className = "lbl";
+    stat.id = "lumen-cloud-status";
+    swrap.appendChild(stat); srow.appendChild(swrap);
+    var sctrl = document.createElement("span"); sctrl.className = "lumen-ctrl";
+    srow.appendChild(sctrl);
+    body.appendChild(srow);
+
+    var form = document.createElement("div");
+    body.appendChild(form);
+
+    function showForm() {
+      form.textContent = "";
+      var crow = document.createElement("div"); crow.className = "lumen-row";
+      var cwrap = document.createElement("div"); cwrap.className = "lumen-lblwrap";
+      var clbl = document.createElement("div"); clbl.className = "lbl";
+      clbl.textContent = S.cabinetCode;
+      var chint = document.createElement("div"); chint.className = "lumen-desc";
+      chint.textContent = S.cabinetCodeHint;
+      cwrap.appendChild(clbl); cwrap.appendChild(chint); crow.appendChild(cwrap);
+      var cctrl = document.createElement("span");
+      cctrl.className = "lumen-ctrl lumen-cabinet-ctrl";
+      var input = document.createElement("input");
+      input.type = "text"; input.className = "lumen-cabinet-code";
+      input.placeholder = "XXXX-XXXX-XXXX";
+      input.setAttribute("autocomplete", "off");
+      input.setAttribute("autocapitalize", "characters");
+      input.setAttribute("spellcheck", "false");
+      input.addEventListener("input", function () {
+        var formatted = cloudCabinetFormatInput(input.value);
+        if (formatted !== input.value) input.value = formatted;
+      });
+      var connect = cloudCabinetButton(S.cabinetConnect, false);
+      cctrl.appendChild(input); cctrl.appendChild(connect); crow.appendChild(cctrl);
+      form.appendChild(crow);
+
+      var msg = document.createElement("div");
+      msg.className = "lumen-desc lumen-cabinet-msg";
+      msg.style.display = "none";
+      form.appendChild(msg);
+      function showError(text) {
+        msg.textContent = text; msg.classList.add("err"); msg.style.display = "";
+      }
+
+      var adv = document.createElement("div");
+      adv.className = "lumen-adv lumen-cabinet-adv";
+      adv.setAttribute("role", "button");
+      form.appendChild(adv);
+      var advBody = document.createElement("div");
+      form.appendChild(advBody);
+      function drawAdvanced() {
+        adv.textContent = S.cabinetAdvanced + (draft.cabinet_advanced ? " ▾" : " ›");
+        advBody.textContent = "";
+        if (!draft.cabinet_advanced) return;
+        advBody.appendChild(cloudTextRow(S.cabinetServer, draft.cabinet_server,
+          "https://cabinet.mc2.onl", false,
+          function (value) { draft.cabinet_server = value; }));
+        var shint = document.createElement("div"); shint.className = "lumen-desc";
+        shint.textContent = S.cabinetServerHint; advBody.appendChild(shint);
+      }
+      adv.addEventListener("click", function () {
+        draft.cabinet_advanced = !draft.cabinet_advanced; drawAdvanced();
+      });
+      drawAdvanced();
+
+      connect.addEventListener("click", function () {
+        if (connect.classList.contains("busy")) return;
+        var code = input.value.trim();
+        var server = String(draft.cabinet_server || "").trim();
+        // A connect link pasted into the code field carries its own token.
+        if (code.indexOf("://") !== -1) { server = code; code = ""; }
+        var isLink = /\/connect\/?#cab_/.test(server);
+        if (!isLink && !cloudCabinetNormalizeCode(code)) {
+          showError(S.cabinetCodeInvalid); return;
+        }
+        msg.style.display = "none";
+        connect.classList.add("busy"); connect.textContent = S.cabinetConnecting;
+        call("LumenCloudCabinetConnect", { json: JSON.stringify({
+          code: isLink ? "" : cloudCabinetNormalizeCode(code), server: server,
+        }) })
+          .then(function (raw) {
+            var r; try { r = JSON.parse(raw); } catch (e) {}
+            if (!r || !r.success) {
+              connect.classList.remove("busy"); connect.textContent = S.cabinetConnect;
+              showError(cloudCabinetErrorText(S, r)); return;
+            }
+            draft.authenticated.cabinet = true;
+            draft.cabinet_account = r.account || {};
+            draft.sign_out_provider = null;
+            cloudRender(body, S, status);
+          })
+          .catch(function (e) {
+            connect.classList.remove("busy"); connect.textContent = S.cabinetConnect;
+            showError(S.cabinetConnectFail + (e && e.message ? e.message : e));
+          });
+      });
+    }
+
+    function showDisconnect() {
+      var btn = cloudCabinetButton(S.cabinetDisconnect, true);
+      btn.addEventListener("click", function () {
+        draft.sign_out_provider = "cabinet";
+        draft.authenticated.cabinet = false;
+        draft.cabinet_account = null;
+        draft.provider = "local";
+        cloudRender(body, S, status);
+      });
+      sctrl.appendChild(btn);
+    }
+
+    if (staged) {
+      stat.textContent = cloudCabinetConnectedText(S, staged);
+      showDisconnect();
+      return;
+    }
+    if (!stored) {
+      stat.textContent = S.cabinetNotConnected;
+      showForm();
+      return;
+    }
+    stat.textContent = S.cabinetChecking;
+    showDisconnect();
+    if (!_cloudCabinetLookup) {
+      _cloudCabinetLookup = call("LumenCloudCabinetAccount", {})
+        .then(function (raw) { try { return JSON.parse(raw); } catch (e) { return null; } })
+        .catch(function () { return null; });
+    }
+    _cloudCabinetLookup.then(function (r) {
+      if (!stat.isConnected && stat.isConnected !== undefined) return;
+      var host = r && r.host || applied.host || "";
+      if (r && r.success) {
+        stat.textContent = cloudCabinetConnectedText(S, r);
+      } else if (r && r.reason === "revoked") {
+        stat.textContent = S.cabinetRevoked.replace("{host}", host);
+        showForm();
+      } else {
+        stat.textContent = S.cabinetUnreachable.replace("{host}", host);
+      }
+    });
+  }
+
   // Draw the tab from the applied status plus the in-memory draft.
   function cloudRender(body, S, status) {
     cloudStopAuthPoll();
@@ -289,7 +496,7 @@
     var pctrl = document.createElement("span");
     pctrl.className = "lumen-ctrl";
     var sel = document.createElement("select");
-    [["local", S.providerNone], ["folder", S.providerFolder],
+    [["cabinet", S.providerCabinet], ["local", S.providerNone], ["folder", S.providerFolder],
      ["gdrive", S.providerGdrive], ["onedrive", S.providerOnedrive],
      ["r2", S.providerR2], ["s3", S.providerS3]]
       .forEach(function (opt) {
@@ -320,6 +527,8 @@
       ln.style.marginTop = "8px";
       ln.textContent = S.localNote;
       body.appendChild(ln);
+    } else if (provider === "cabinet") {
+      cloudRenderCabinet(body, S, status);
     } else if (provider === "gdrive" || provider === "onedrive") {
 
     var srow = document.createElement("div");
@@ -763,6 +972,7 @@
   function cloudReload(body) {
     var S = cloudStrings();
     cloudStopAuthPoll();
+    _cloudCabinetLookup = null;
     return call("LumenCloudStatus", {})
       .then(function (res) {
         var status; try { status = JSON.parse(res); } catch (e) {}
