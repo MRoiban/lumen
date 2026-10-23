@@ -653,4 +653,181 @@ do
   os.execute("rm -rf '" .. dir .. "'")
 end
 
+-- ── Cabinet: pairing-code and server validation (pure) ─────────────────────
+do
+  eq(cs.normalize_cabinet_code("ABCD-EFGH-JKMN"), "ABCD-EFGH-JKMN", "canonical code")
+  eq(cs.normalize_cabinet_code(" abcd efgh jkmn "), "ABCD-EFGH-JKMN",
+    "codes are case-insensitive and ignore spaces")
+  eq(cs.normalize_cabinet_code("abcdefghjkmn"), "ABCD-EFGH-JKMN", "dashes are optional")
+  eq(cs.normalize_cabinet_code("O0IL-1234-5678"), "0011-1234-5678",
+    "O reads as 0, I and L as 1")
+  eq(cs.normalize_cabinet_code("ABCD-EFGH-JKM"), nil, "an 11-character code is rejected")
+  eq(cs.normalize_cabinet_code("ABCD-EFGH-JKMNP"), nil, "a 13-character code is rejected")
+  eq(cs.normalize_cabinet_code("ABCD-EFGH-JKMU"), nil, "U is not Crockford base32")
+  eq(cs.normalize_cabinet_code("ABCD-EFGH-JK;N"), nil, "punctuation is rejected")
+  eq(cs.normalize_cabinet_code(nil), nil, "a missing code is rejected")
+
+  eq(cs.parse_cabinet_server(nil).server, "https://cabinet.mc2.onl", "default server")
+  eq(cs.parse_cabinet_server("  ").server, "https://cabinet.mc2.onl", "blank means default")
+  eq(cs.parse_cabinet_server("Cabinet.Example.org/").server, "https://cabinet.example.org",
+    "a bare host gets https and loses the trailing slash")
+  eq(cs.parse_cabinet_server("https://cab.example:8443").server, "https://cab.example:8443",
+    "an origin with a port is kept")
+  local link = "https://cab.example/connect#cab_" .. string.rep("A", 43)
+  eq(cs.parse_cabinet_server(link).link, link, "a full connect link is recognized")
+  eq(cs.parse_cabinet_server("https://cab.example/some/path"), nil, "paths are rejected")
+  eq(cs.parse_cabinet_server("https://cab.example'; rm -rf ~"), nil, "garbage is rejected")
+  eq(cs.parse_cabinet_server("ftp://cab.example"), nil, "only http(s) origins")
+end
+
+-- ── Cabinet: connect stages the CLI's token; apply promotes it ─────────────
+do
+  local dir = os.tmpname(); os.remove(dir); assert(os.execute("mkdir -p '" .. dir .. "'"))
+  local cli = dir .. "/cloud_redirect_cli"
+  local cf = assert(io.open(cli, "wb")); cf:write("stub"); cf:close()
+  local cfgp = dir .. "/config.json"
+  local original = '{"provider":"gdrive","keep":5}'
+  local f = assert(io.open(cfgp, "wb")); f:write(original); f:close()
+  local cred = dir .. "/tokens_cabinet.json"
+  local TOKEN = "cab_" .. string.rep("t", 43)
+
+  -- Mimics cloud_redirect_cli cabinet-connect: writes both files, prints JSON.
+  local commands = {}
+  local function fake_cli(cmd)
+    commands[#commands + 1] = cmd
+    local w = assert(io.open(cred, "wb"))
+    w:write(json.encode({ server = "https://cabinet.mc2.onl", token = TOKEN })); w:close()
+    local c = assert(io.open(cfgp, "wb"))
+    c:write(json.encode({ provider = "cabinet", token_path = cred,
+                          token_paths = { cabinet = cred }, keep = 5 })); c:close()
+    return '[INFO] pairing\n' .. json.encode({
+      success = true, provider = "cabinet", server = "https://cabinet.mc2.onl",
+      user = { id = "u1", name = "Mihai" }, credentials_path = cred, config_path = cfgp,
+    }), true
+  end
+
+  local bad = json.decode(cs.cabinet_connect(cfgp, { code = "ABCD-EFGH-JKM" },
+    { cli_path = cli, exec = function() error("CLI must not run for a malformed code") end }))
+  eq(bad.success, false, "a malformed code fails locally")
+  eq(bad.reason, "invalid_code", "a malformed code reports invalid_code")
+
+  local res = json.decode(cs.cabinet_connect(cfgp, { code = "abcd efgh jkmn" },
+    { cli_path = cli, exec = fake_cli }))
+  eq(res.success, true, "cabinet connect succeeds")
+  eq(res.pending, true, "cabinet connect is staged, not applied")
+  eq(res.account.host, "cabinet.mc2.onl", "connect reports the server host")
+  eq(res.account.user.name, "Mihai", "connect reports the Cabinet user")
+  eq(res.account.token, nil, "connect never returns the token")
+  ok(commands[1]:find("cabinet%-connect 'ABCD%-EFGH%-JKMN'") ~= nil,
+    "the CLI receives the normalized code as one quoted argument")
+  ok(not commands[1]:find("--server", 1, true), "the default server is implied")
+  eq(assert(io.open(cfgp, "rb")):read("*a"), original,
+    "connect leaves config.json as it was until Save and restart")
+  ok(io.open(cred, "rb") == nil, "connect leaves no live credential before apply")
+
+  local st = json.decode(cs.status(cfgp))
+  eq(st.providers.cabinet.authenticated, false, "staged cabinet is not yet stored")
+  eq(st.providers.cabinet.pending, true, "status reports the staged cabinet login")
+  eq(st.providers.cabinet.pending_account.user.name, "Mihai",
+    "status carries the staged account for display")
+
+  local applied = json.decode(cs.apply_and_restart(cfgp,
+    { provider = "cabinet", sync_activity = false }, { restart = function() return true end }))
+  eq(applied.success, true, "cabinet draft applies")
+  local cfg = cs.read_config(cfgp)
+  eq(cfg.provider, "cabinet", "cabinet becomes the active provider")
+  eq(cfg.token_paths.cabinet, cred, "cabinet credential path registered")
+  eq(cfg.keep, 5, "unrelated config survives the cabinet apply")
+  local stored = json.decode(assert(io.open(cred, "rb")):read("*a"))
+  eq(stored.token, TOKEN, "the staged token is promoted")
+  eq(stored.server, "https://cabinet.mc2.onl", "the server is promoted")
+  st = json.decode(cs.status(cfgp))
+  eq(st.authenticated, true, "provider_status: cabinet with server+token is authenticated")
+  eq(st.providers.cabinet.settings.host, "cabinet.mc2.onl", "status exposes the host")
+  eq(st.providers.cabinet.settings.token, nil, "status never exposes the token")
+  eq(st.providers.cabinet.pending_account, nil, "apply clears the staged account")
+
+  -- A custom server and a full connect link reach the CLI as separate args.
+  commands = {}
+  cs.cabinet_connect(cfgp, { code = "ABCDEFGHJKMN", server = "cab.example.org" },
+    { cli_path = cli, exec = fake_cli })
+  ok(commands[1]:find("'ABCD%-EFGH%-JKMN' '%-%-server' 'https://cab.example.org'") ~= nil,
+    "a custom server is passed with --server")
+  local link = "https://cab.example.org/connect#cab_" .. string.rep("B", 43)
+  cs.cabinet_connect(cfgp, { code = "", server = link }, { cli_path = cli, exec = fake_cli })
+  ok(commands[2]:find("cabinet%-connect '" .. link:gsub("%p", "%%%0") .. "'") ~= nil,
+    "a connect link is used without a code")
+  local still = json.decode(assert(io.open(cred, "rb")):read("*a"))
+  eq(still.token, TOKEN, "a later staged connect leaves the applied token in place")
+  json.decode(cs.discard_pending())
+  eq(json.decode(cs.status(cfgp)).providers.cabinet.pending, false, "discard drops the staged login")
+
+  -- Server-side rejection: the reason is classified, nothing is written.
+  local before = assert(io.open(cfgp, "rb")):read("*a")
+  local rejected = json.decode(cs.cabinet_connect(cfgp, { code = "ABCD-EFGH-JKMN" }, {
+    cli_path = cli,
+    exec = function() return '{"success":false,"error":"Cabinet pairing failed: invalid_code"}', false end,
+  }))
+  eq(rejected.success, false, "a rejected code fails")
+  eq(rejected.reason, "code_rejected", "a rejected code is classified")
+  eq(assert(io.open(cfgp, "rb")):read("*a"), before, "a rejected code changes nothing")
+
+  -- GET /api/me for the stored token: name, revoked, unreachable.
+  local seen
+  local function fake_http(status, body)
+    return { get = function(url, opts) seen = { url = url, opts = opts }
+      return { status = status, body = body } end }
+  end
+  local acct = json.decode(cs.cabinet_account(cfgp,
+    { http = fake_http(200, '{"user":{"id":"u1","name":"Mihai"}}') }))
+  eq(acct.success, true, "account lookup succeeds")
+  eq(acct.user.name, "Mihai", "account lookup returns the Cabinet user")
+  eq(acct.host, "cabinet.mc2.onl", "account lookup returns the host")
+  eq(seen.url, "https://cabinet.mc2.onl/api/me", "account lookup asks /api/me")
+  local headers = seen.opts.headers
+  eq(headers["Authorization"], "Bearer " .. TOKEN, "account lookup sends the bearer token")
+  ok(type(headers["User-Agent"]) == "string" and headers["User-Agent"] ~= "",
+    "account lookup sends a User-Agent (Cloudflare 1010)")
+  eq(acct.token, nil, "account lookup never returns the token")
+  local revoked = json.decode(cs.cabinet_account(cfgp,
+    { http = fake_http(401, '{"error":"unauthorized"}') }))
+  eq(revoked.reason, "revoked", "a 401 reads as a revoked device")
+  local offline = json.decode(cs.cabinet_account(cfgp,
+    { http = { get = function() return nil, "timeout" end } }))
+  eq(offline.reason, "unreachable", "a transport failure reads as unreachable")
+
+  -- Remote listing goes through the provider-generic CLI command.
+  local listed_cmd
+  local remote = json.decode(cs.remote_appids(cfgp, 77, { cli_path = cli,
+    exec = function(cmd) listed_cmd = cmd; return '{"success":true,"app_ids":["42"]}', true end }))
+  eq(remote.appids[1], 42, "cabinet remote listing works")
+  ok(listed_cmd:find("list%-remote%-app%-ids 'cabinet'") ~= nil, "cabinet listing uses the CLI")
+
+  -- Disconnect: the draft signs out to local and removes the credential.
+  local out = json.decode(cs.apply_and_restart(cfgp,
+    { provider = "local", sync_activity = false, sign_out_provider = "cabinet" },
+    { restart = function() return true end }))
+  eq(out.success, true, "cabinet disconnect applies")
+  eq(cs.read_config(cfgp).provider, "local", "disconnect returns to local")
+  ok(io.open(cred, "rb") == nil, "disconnect removes the cabinet credential")
+  eq(json.decode(cs.cabinet_account(cfgp)).reason, "not_connected",
+    "account lookup after disconnect is not_connected")
+  local refused = json.decode(cs.apply_and_restart(cfgp,
+    { provider = "cabinet", sync_activity = false }, { restart = function() return true end }))
+  eq(refused.success, false, "cabinet cannot be applied without a credential")
+
+  os.execute("rm -rf '" .. dir .. "'")
+end
+
+-- ── Cabinet RPCs are registered for the tab ────────────────────────────────
+do
+  local registry = cs.register({}, "/nonexistent/config.json")
+  eq(type(registry.LumenCloudCabinetConnect), "function", "LumenCloudCabinetConnect registered")
+  eq(type(registry.LumenCloudCabinetAccount), "function", "LumenCloudCabinetAccount registered")
+  local rpc = require("rpc")
+  local _, raw = rpc.dispatch(registry.LumenCloudCabinetConnect,
+    { json = json.encode({ code = "nope" }) })
+  eq(json.decode(raw).reason, "invalid_code", "connect RPC decodes its json argument")
+end
+
 print("test_cloudsettings: ALL PASS")

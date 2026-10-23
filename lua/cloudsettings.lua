@@ -338,6 +338,21 @@ local function sanitized_credentials(provider, value)
   return out
 end
 
+local function cabinet_credentials_valid(value)
+  return type(value) == "table" and nonempty(value.server) and nonempty(value.token)
+end
+
+-- "https://cabinet.mc2.onl/" -> "cabinet.mc2.onl", for the status line.
+local function origin_host(server)
+  if type(server) ~= "string" then return "" end
+  return server:match("^%a[%w+.-]*://([^/?#]+)") or server
+end
+
+-- The account named by the last successful pairing, held until the draft is
+-- applied or discarded. Only display data: the token itself sits in the staged
+-- credential file, never in memory or in an RPC response.
+local staged_cabinet = nil
+
 local function provider_status(config_path, provider, cfg)
   if provider == "local" then return { authenticated = false } end
   if provider == "folder" then
@@ -348,6 +363,17 @@ local function provider_status(config_path, provider, cfg)
     }
   end
   local path = token_path_for(config_path, provider, cfg)
+  if provider == "cabinet" then
+    local value = read_json_file(path)
+    local server = cabinet_credentials_valid(value) and value.server or ""
+    local out = {
+      authenticated = cabinet_credentials_valid(value),
+      pending = staged_tokens.cabinet ~= nil,
+      settings = { server = server, host = origin_host(server) },
+    }
+    if staged_cabinet then out.pending_account = staged_cabinet end
+    return out
+  end
   if provider == "gdrive" or provider == "onedrive" then
     return {
       authenticated = has_refresh_token(path),
@@ -371,7 +397,7 @@ function cloudsettings.status(config_path)
   local cfg = cloudsettings.read_config(config_path)
   local provider = cfg.provider or "local"
   local providers = {}
-  for _, name in ipairs({ "local", "folder", "gdrive", "onedrive", "r2", "s3" }) do
+  for _, name in ipairs({ "local", "cabinet", "folder", "gdrive", "onedrive", "r2", "s3" }) do
     providers[name] = provider_status(config_path, name, cfg)
   end
   local authed = providers[provider] and providers[provider].authenticated == true
@@ -413,7 +439,7 @@ end
 -- sign_out(config_path, provider) -> {success[,error]}. Delete the token file
 -- and drop back to local-only.
 function cloudsettings.sign_out(config_path, provider)
-  if provider == "gdrive" or provider == "onedrive" then
+  if provider == "gdrive" or provider == "onedrive" or provider == "cabinet" then
     os.remove(token_path_for(config_path, provider, cloudsettings.read_config(config_path)))
   end
   local ok, err = set_config_key(config_path, "provider", "local")
@@ -429,8 +455,8 @@ function cloudsettings.apply_and_restart(config_path, request, deps)
   deps = deps or {}
   local provider = request.provider
   local supported = {
-    ["local"] = true, folder = true, gdrive = true, onedrive = true,
-    r2 = true, s3 = true,
+    ["local"] = true, cabinet = true, folder = true, gdrive = true,
+    onedrive = true, r2 = true, s3 = true,
   }
   if not supported[provider] then
     return json.encode({ success = false, error = "unknown provider" })
@@ -441,10 +467,16 @@ function cloudsettings.apply_and_restart(config_path, request, deps)
   local snapshots = { { value = read_file_snapshot(config_path), private = false } }
   local final_token
   local staged_token
-  if provider == "gdrive" or provider == "onedrive" then
+  if provider == "gdrive" or provider == "onedrive" or provider == "cabinet" then
     final_token = token_path_for(config_path, provider, cfg)
     staged_token = staged_tokens[provider]
-    if not staged_token and not has_refresh_token(final_token) then
+    local stored
+    if provider == "cabinet" then
+      stored = cabinet_credentials_valid(read_json_file(final_token))
+    else
+      stored = has_refresh_token(final_token)
+    end
+    if not staged_token and not stored then
       return json.encode({ success = false, error = "provider not authenticated" })
     end
     snapshots[#snapshots + 1] = {
@@ -591,6 +623,7 @@ function cloudsettings.apply_and_restart(config_path, request, deps)
     os.remove(path)
     staged_tokens[staged_provider] = nil
   end
+  staged_cabinet = nil
   return json.encode({ success = true, restarting = true })
 end
 
@@ -672,6 +705,168 @@ local function cli_json(command, args, deps)
   return result
 end
 
+-- ── Cabinet (self-hosted) pairing ───────────────────────────────────────────
+-- Cabinet pairs a device with a short one-time code instead of OAuth. The CLI
+-- redeems it (`cabinet-connect <code> [--server <origin>]`, or a whole connect
+-- link) and writes tokens_cabinet.json + config.json directly. Lumen keeps its
+-- draft contract on top of that: the CLI's writes are moved into a staged
+-- credential and the previous files restored, so nothing changes for the hook
+-- until "Save and restart" promotes the staged token like an OAuth login.
+
+cloudsettings.CABINET_DEFAULT_SERVER = "https://cabinet.mc2.onl"
+
+-- normalize_cabinet_code(raw) -> "XXXX-XXXX-XXXX" or nil. Crockford base32 with
+-- the server's forgiving reading: case-insensitive, spaces and dashes ignored,
+-- O reads as 0 and I/L as 1. Checked here first so a typo never spends one of
+-- the server's rate-limited redemption attempts.
+function cloudsettings.normalize_cabinet_code(raw)
+  if type(raw) ~= "string" then return nil end
+  local s = raw:upper():gsub("[%s%-]", ""):gsub("O", "0"):gsub("[IL]", "1")
+  if #s ~= 12 or s:find("[^0-9A-HJKMNP-TV-Z]") then return nil end
+  return s:sub(1, 4) .. "-" .. s:sub(5, 8) .. "-" .. s:sub(9, 12)
+end
+
+-- parse_cabinet_server(raw) -> {server=origin} | {link=connect link} | nil.
+-- The Advanced field takes an origin (scheme optional, https assumed) or a
+-- whole `https://<server>/connect#cab_…` link, which carries its own token and
+-- needs no pairing code. Blank means the default server.
+function cloudsettings.parse_cabinet_server(raw)
+  if raw == nil then return { server = cloudsettings.CABINET_DEFAULT_SERVER } end
+  if type(raw) ~= "string" then return nil end
+  local s = raw:match("^%s*(.-)%s*$")
+  if s == "" then return { server = cloudsettings.CABINET_DEFAULT_SERVER } end
+  if s:find("[%z%c%s]") then return nil end
+  if s:match("^https?://[^/?#@]+/connect/?#cab_[%w_%-]+$") then return { link = s } end
+  if not s:find("://", 1, true) then s = "https://" .. s end
+  local scheme, host = s:match("^(https?)://([^/?#@]+)/*$")
+  if not scheme or not host:match("^[%w%.%-]+:?%d*$") then return nil end
+  return { server = scheme .. "://" .. host:lower() }
+end
+
+-- Map the CLI/server failure text onto a reason the tab can phrase itself.
+local function cabinet_failure_reason(err)
+  local e = tostring(err or ""):lower()
+  if e:find("too_many_attempts", 1, true) or e:find("429", 1, true) then
+    return "too_many_attempts"
+  end
+  if e:find("invalid_code", 1, true) then return "code_rejected" end
+  if e:find("not installed", 1, true) then return "cli_missing" end
+  return "failed"
+end
+
+-- cabinet_connect(config_path, {code, server}[, deps]) -> JSON
+-- {success, pending, account={server,host,user={id,name}}} or
+-- {success=false, reason, error}. The code and token are never logged: the CLI
+-- runs with stderr discarded and only its JSON result line is parsed. The code
+-- does appear on the CLI's argv, which is the CLI's contract; it is single-use
+-- and expires in 15 minutes.
+function cloudsettings.cabinet_connect(config_path, request, deps)
+  request = type(request) == "table" and request or {}
+  local target = cloudsettings.parse_cabinet_server(request.server)
+  if not target then
+    return json.encode({ success = false, reason = "invalid_server", error = "invalid server" })
+  end
+  local args
+  if target.link then
+    args = { target.link }
+  else
+    local code = cloudsettings.normalize_cabinet_code(request.code)
+    if not code then
+      return json.encode({ success = false, reason = "invalid_code", error = "invalid code" })
+    end
+    args = { code }
+    if target.server ~= cloudsettings.CABINET_DEFAULT_SERVER then
+      args[#args + 1] = "--server"
+      args[#args + 1] = target.server
+    end
+  end
+
+  local cfg = cloudsettings.read_config(config_path)
+  local cred_path = token_path_for(config_path, "cabinet", cfg)
+  local config_snap = read_file_snapshot(config_path)
+  local cred_snap = read_file_snapshot(cred_path)
+
+  local result, err = cli_json("cabinet-connect", args, deps)
+  local written
+  if result then
+    -- Trust the CLI's reported location only inside the config directory, the
+    -- same confinement token_path_for applies to config-supplied paths.
+    local dir = dirname(config_path)
+    local reported = result.credentials_path
+    local path = cred_path
+    if type(reported) == "string" and reported:sub(1, #dir + 1) == dir .. "/"
+        and not reported:find("/%.%./") and not reported:find("[%z\n\r]") then
+      path = reported
+    end
+    written = read_json_file(path)
+  end
+  -- Undo the CLI's direct writes; the draft owns when the hook sees them.
+  restore_file_snapshot(cred_snap, true)
+  restore_file_snapshot(config_snap, false)
+
+  if not result then
+    return json.encode({ success = false, reason = cabinet_failure_reason(err),
+                         error = tostring(err or "connect failed") })
+  end
+  if not cabinet_credentials_valid(written) then
+    return json.encode({ success = false, reason = "failed",
+                         error = "Cabinet credentials were not written" })
+  end
+  local staged = cred_path .. ".lumen-pending"
+  if not cloudsettings.write_token_file(staged, written) then
+    return json.encode({ success = false, reason = "failed", error = "cannot write token" })
+  end
+  staged_tokens.cabinet = staged
+  local user = type(result.user) == "table" and result.user or {}
+  staged_cabinet = {
+    server = written.server,
+    host = origin_host(written.server),
+    user = { id = tostring(user.id or ""), name = tostring(user.name or "") },
+  }
+  return json.encode({ success = true, pending = true, account = staged_cabinet })
+end
+
+-- cabinet_account(config_path[, deps]) -> JSON {success, server, host,
+-- user={id,name}} for the STORED credential, or {success=false, reason=
+-- "not_connected"|"revoked"|"unreachable"}. Asks GET /api/me so a token revoked
+-- from /admin shows up as such instead of as silent sync failures.
+function cloudsettings.cabinet_account(config_path, deps)
+  deps = deps or {}
+  local cfg = cloudsettings.read_config(config_path)
+  local creds = read_json_file(token_path_for(config_path, "cabinet", cfg))
+  if not cabinet_credentials_valid(creds) then
+    return json.encode({ success = false, reason = "not_connected" })
+  end
+  local server = creds.server:gsub("/+$", "")
+  local host = origin_host(server)
+  local http_mod = deps.http or require("http")
+  local resp, herr = http_mod.get(server .. "/api/me", {
+    timeout = 10,
+    headers = {
+      ["Authorization"] = "Bearer " .. creds.token,
+      ["Accept"] = "application/json",
+      -- Cloudflare in front of Cabinet rejects agent-less requests (error 1010).
+      ["User-Agent"] = "lumen",
+    },
+    allow_http = (server:sub(1, 7) == "http://" and creds.allow_insecure_http == true) or nil,
+  })
+  if not resp then
+    return json.encode({ success = false, reason = "unreachable", server = server,
+                         host = host, error = tostring(herr or "request failed") })
+  end
+  if resp.status == 401 or resp.status == 403 then
+    return json.encode({ success = false, reason = "revoked", server = server, host = host })
+  end
+  local ok, body = pcall(json.decode, resp.body or "")
+  local user = ok and type(body) == "table" and type(body.user) == "table" and body.user
+  if resp.status ~= 200 or not user then
+    return json.encode({ success = false, reason = "unreachable", server = server,
+                         host = host, error = "HTTP " .. tostring(resp.status) })
+  end
+  return json.encode({ success = true, server = server, host = host,
+    user = { id = tostring(user.id or ""), name = tostring(user.name or "") } })
+end
+
 local function folder_appids(root, account)
   local path = tostring(root or "") .. "/" .. tostring(account)
   if lfs.attributes(path, "mode") ~= "directory" then return {} end
@@ -694,6 +889,7 @@ function cloudsettings.discard_pending()
     os.remove(path)
     staged_tokens[provider] = nil
   end
+  staged_cabinet = nil
   return json.encode({ success = true })
 end
 
@@ -1103,7 +1299,7 @@ function cloudsettings.remote_appids(config_path, account, deps)
     if not appids then return json.encode({ success = false, error = err, provider = provider }) end
     return json.encode({ success = true, appids = json.array(appids), provider = provider })
   end
-  if provider == "r2" or provider == "s3" then
+  if provider == "r2" or provider == "s3" or provider == "cabinet" then
     local result, err = cli_json("list-remote-app-ids", { provider, tostring(acct) }, deps)
     if not result then return json.encode({ success = false, error = err, provider = provider }) end
     local appids = {}
@@ -1185,6 +1381,12 @@ function cloudsettings.register(registry, config_path)
   end
   registry.LumenCloudOpenUrl = function(j)
     return cloudsettings.open_url(decode_arg(j).url)
+  end
+  registry.LumenCloudCabinetConnect = function(j)
+    return cloudsettings.cabinet_connect(cp, decode_arg(j))
+  end
+  registry.LumenCloudCabinetAccount = function()
+    return cloudsettings.cabinet_account(cp)
   end
   registry.LumenCloudApps = function() return cloudsettings.list_apps() end
   registry.LumenCloudRemoteApps = function(j)
