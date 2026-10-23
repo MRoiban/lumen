@@ -203,10 +203,10 @@ if beta_ready then
     return { get = function() return { status = status, body = body }, nil end }
   end
   local component = {
-    repo = "swwayps/lumen", beta_path = "dist/lumen-linux.zip",
+    repo = "MRoiban/lumen", beta_path = "dist/lumen-linux.zip",
   }
   check("beta contents API URL", about.beta_api_url(component) ==
-    "https://api.github.com/repos/swwayps/lumen/contents/dist/lumen-linux.zip?ref=beta")
+    "https://api.github.com/repos/MRoiban/lumen/contents/dist/lumen-linux.zip?ref=beta")
   local info = about.parse_beta_info(
     '{"sha":"0123456789abcdef","size":2733136,' ..
     '"download_url":"https://raw.example/lumen-linux.zip"}')
@@ -372,7 +372,7 @@ do
   end
   local http = { get = function(url)
     if url:find("/contents/", 1, true) then
-      if url:find("/swwayps/lumen/", 1, true) then
+      if url:find("/MRoiban/lumen/", 1, true) then
         return { status = 200, body =
           '{"sha":"beta-lumen-sha","size":200,"download_url":"https://raw/beta"}' }
       end

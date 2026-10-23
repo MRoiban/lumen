@@ -30,7 +30,7 @@ slscheck.LIB_NEEDLE = "SLSsteam.so"
 -- install.sh) so fixes go live without cutting a new release. The main line is
 -- the branch literally named `slsteam-moon`.
 slscheck.AUTOFIX_URL =
-  "https://raw.githubusercontent.com/swwayps/slsteam-moon/slsteam-moon/autofix.sh"
+  "https://raw.githubusercontent.com/MRoiban/slsteam-moon/slsteam-moon/autofix.sh"
 
 -- Single-quote a token for safe POSIX-shell interpolation.
 local function shq(s)
